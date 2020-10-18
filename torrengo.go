@@ -4,20 +4,20 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/olekukonko/tablewriter"
 	"github.com/onrik/logrus/filename"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/crypto/ssh/terminal"
 
 	"github.com/juliensalinas/torrengo/arc"
 	"github.com/juliensalinas/torrengo/otts"
@@ -39,8 +39,8 @@ var sources = map[string]string{
 // isVerbose is used to switch debugging on or off
 var isVerbose bool
 
-// ft is the final torrent the user wants to download
-var ft torrent
+// fts are the final torrents the user wants to download
+var fts []torrent
 
 // torrent contains meta information about the torrent
 type torrent struct {
@@ -58,6 +58,69 @@ type torrent struct {
 	source string
 	// Local path where torrent was saved
 	filePath string
+}
+
+var seasonAndEpisode = regexp.MustCompile(`(?i)S(?P<Season>[0-9]+)E(?P<Episode>[0-9]+)`)
+
+type torrentsSlice []torrent
+
+func (s torrentsSlice) Len() int {
+	return len(s)
+}
+func (s torrentsSlice) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
+func (s torrentsSlice) Less(i, j int) bool {
+	// try one (name)
+	// return len(s[i].uplDate) < len(s[j].uplDate)
+
+	if !(seasonAndEpisode.MatchString(s[i].name) && seasonAndEpisode.MatchString(s[j].name)) {
+		// try two (date)
+		t1, err := time.Parse("2006-01-02", s[i].uplDate)
+		if err != nil {
+			log.WithFields(log.Fields{"date": s[i].uplDate}).Debug("unable to parse date")
+			return false
+		}
+		t2, err := time.Parse("2006-01-02", s[j].uplDate)
+		if err != nil {
+			log.WithFields(log.Fields{"date": s[j].uplDate}).Debug("unable to parse date")
+			return false
+		}
+		return t1.Before(t2)
+	}
+
+	// try three (parse season and episode regexp)
+	iArr := seasonAndEpisode.FindStringSubmatch(s[i].name)
+	jArr := seasonAndEpisode.FindStringSubmatch(s[j].name)
+
+	if !(len(iArr) == 3 && len(jArr) == 3) {
+		return false
+	}
+
+	// found in both
+	seasonI, err := strconv.Atoi(iArr[1])
+	if err != nil {
+		return false
+	}
+	episodeI, err := strconv.Atoi(iArr[2])
+	if err != nil {
+		return false
+	}
+
+	seasonJ, err := strconv.Atoi(jArr[1])
+	if err != nil {
+		return false
+	}
+	episodeJ, err := strconv.Atoi(jArr[2])
+	if err != nil {
+		return false
+	}
+
+	if seasonI == seasonJ {
+		return episodeI < episodeJ
+	}
+
+	return seasonI < seasonJ
 }
 
 // torListAndHTTPClient contains the torrents found and the http client
@@ -95,10 +158,51 @@ func (s *search) sortOut() {
 }
 
 // render renders torrents in a tabular user-friendly way with colors in terminal
-func render(torrents []torrent) {
+func render(torrents []torrent, includeStr, excludeStr string) (
+	map[int]torrent, map[torrent]int,
+) {
+	log.Debugf("in rendering, include: %v - exclude: %v", includeStr, excludeStr)
+
+	// Set include
+	var include *regexp.Regexp
+	if includeStr != "" {
+		include = regexp.MustCompile(fmt.Sprintf(`%s`, includeStr))
+	}
+
+	// Set exclude
+	var exclude *regexp.Regexp
+	if excludeStr != "" {
+		exclude = regexp.MustCompile(fmt.Sprintf(`%s`, excludeStr))
+	}
+
 	// Turn type []torrent to type [][]string because this is what tablewriter expects
 	var renderedTorrents [][]string
+	var finalTorrents []torrent
+	indexToTorrent := map[int]torrent{}
+	torrentToIndex := map[torrent]int{}
 	for i, t := range torrents {
+		// run through include
+		if include != nil && !include.MatchString(t.name) {
+			continue
+		}
+		// run through exclude
+		if exclude != nil && exclude.MatchString(t.name) {
+			continue
+		}
+		finalTorrents = append(finalTorrents, t)
+		torrentToIndex[t] = i
+	}
+
+	log.Debugf("in rendering, final torrents: %d", len(finalTorrents))
+	if len(finalTorrents) == 0 {
+		return nil, nil
+	}
+
+	// sort torrents to render
+	sort.Sort(torrentsSlice(finalTorrents))
+
+	for i := len(finalTorrents) - 1; i >= 0; i-- {
+		t := finalTorrents[i]
 		// Replace -1 by unknown because more user-friendly
 		seedersStr := strconv.Itoa(t.seeders)
 		if seedersStr == "-1" {
@@ -109,6 +213,7 @@ func render(torrents []torrent) {
 			leechersStr = "Unknown"
 		}
 		renderedTorrent := []string{
+			// strconv.Itoa(torrentToIndex[t]),
 			strconv.Itoa(i),
 			t.name,
 			t.size,
@@ -118,6 +223,7 @@ func render(torrents []torrent) {
 			sources[t.source],
 		}
 		renderedTorrents = append([][]string{renderedTorrent}, renderedTorrents...)
+		indexToTorrent[i] = t
 	}
 
 	// Render results using tablewriter
@@ -135,6 +241,7 @@ func render(torrents []torrent) {
 	)
 	table.AppendBulk(renderedTorrents)
 	table.Render()
+	return indexToTorrent, torrentToIndex
 }
 
 // getTorrentFile retrieves and displays torrent file to user.
@@ -143,23 +250,23 @@ func render(torrents []torrent) {
 func getTorrentFile(userID, in string, userPass string,
 	timeout time.Duration, httpClient *http.Client) {
 	var err error
-	switch ft.source {
+	switch fts[0].source {
 	case "arc":
 		log.WithFields(log.Fields{
 			"sourceToSearch": "arc",
 		}).Debug("Download torrent file")
-		ft.filePath, err = arc.FindAndDlFile(ft.descURL, in, timeout)
+		fts[0].filePath, err = arc.FindAndDlFile(fts[0].descURL, in, timeout)
 	case "ygg":
 		log.WithFields(log.Fields{
 			"sourceToSearch": "ygg",
 		}).Debug("Download torrent file")
-		ft.filePath, err = ygg.FindAndDlFile(
-			ft.descURL, in, userID, userPass, timeout, httpClient)
+		fts[0].filePath, err = ygg.FindAndDlFile(
+			fts[0].descURL, in, userID, userPass, timeout, httpClient)
 	}
 	if err != nil {
 		fmt.Println("Could not retrieve the torrent file (see logs for more details).")
 		log.WithFields(log.Fields{
-			"descURL": ft.descURL,
+			"descURL": fts[0].descURL,
 			"error":   err,
 		}).Fatal("Could not retrieve the torrent file")
 	}
@@ -251,6 +358,9 @@ func main() {
 		"you want to search."+lineBreak+"Choices: arc (Archive.org) | tpb (ThePirateBay) | otts (1337x) | ygg (YggTorrent). ")
 	timeoutInMillisecPtr := flag.Int("t", 20000, "Timeout of HTTP requests in milliseconds. Set it to 0 to completely remove timeout.")
 	isVerbosePtr := flag.Bool("v", false, "Verbose mode. Use it to see more logs.")
+	includePtr := flag.String("i", "", "Regexp include to apply")
+	excludePtr := flag.String("e", "", "Regexp exclude to apply")
+	outputPtr := flag.String("o", "", "Output file")
 	flag.Parse()
 
 	// Get timeout and convert it to a proper Go timeout in nanoseconds
@@ -260,6 +370,9 @@ func main() {
 	// Set logging parameters depending on the verbose user input
 	isVerbose = *isVerbosePtr
 	setLogger(isVerbose)
+
+	// Set output
+	output := *outputPtr
 
 	// If no command line argument is supplied, then we stop here
 	if len(flag.Args()) == 0 {
@@ -526,145 +639,210 @@ func main() {
 	s.sortOut()
 
 	// Render the list of results to user in terminal
-	log.Debug("Render results")
-	render(s.out)
+	log.Debugf("Rendering results: %d", len(s.out))
+	idxToTorrent, torrentToOGIdx := render(s.out, *includePtr, *excludePtr)
+	if len(idxToTorrent) == 0 {
+		fmt.Println("No results found")
+		os.Exit(0)
+	}
 
 	// Read from user input the index of torrent we want to download
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Println("Please select a torrent to download (enter its index): ")
 	var index int
+	indexMap := map[int]bool{}
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Println("Please select (a) torrent(s) to download (enter comma separated indexes): ")
 	for {
 		indexStr, err := reader.ReadString('\n') // returns string + delimiter
 		if err != nil {
 			fmt.Println("Could not read your input, please try again (should be an integer):")
 			continue
 		}
-		// Remove delimiter which depends on OS + white spaces if any, and convert to integer
-		index, err = strconv.Atoi(strings.TrimSpace(strings.TrimSuffix(indexStr, lineBreak)))
-		if err != nil {
-			fmt.Println("Please enter an integer:")
-			continue
+
+		trimmedStr := strings.TrimSpace(strings.TrimSuffix(indexStr, lineBreak))
+		trimmedArr := strings.Split(trimmedStr, ",")
+
+		if len(trimmedArr) > 0 {
+			for _, v := range trimmedArr {
+				// see if it is a range
+				if strings.Index(v, "-") > -1 {
+					// has range, enumerate and add to indexMap
+					ranges := strings.Split(v, "-")
+					start, err := strconv.Atoi(ranges[0])
+					if err != nil {
+						fmt.Printf("Please enter integers: %s\n", ranges[0])
+						break
+					}
+					end, err := strconv.Atoi(ranges[1])
+					if err != nil {
+						fmt.Printf("Please enter integers: %s\n", ranges[1])
+						break
+					}
+					if start > end {
+						fmt.Println("start is greater than end:")
+						break
+					}
+					for i := start; i <= end; i++ {
+						indexMap[i] = true
+					}
+				} else {
+					// Remove delimiter which depends on OS + white spaces if any, and convert to integer
+					index, err = strconv.Atoi(v)
+					if err != nil {
+						fmt.Println("Please enter integers:")
+						break
+					}
+				}
+			}
+			indexMap[index] = true
 		}
+
 		break
 	}
 
-	// Final torrent we're working on as of now
-	ft = s.out[index]
-	log.WithFields(log.Fields{
-		"descURL":       ft.descURL,
-		"torrentSource": ft.source,
-	}).Debug("Got the final torrent to work on")
+	// Final torrents we're working on as of now
+	for i := range indexMap {
+		fts = append(fts, s.out[torrentToOGIdx[idxToTorrent[i]]])
+	}
+	fmt.Printf("Got a set of torrents to work on (%d) \n", len(fts))
 
 	// Read from user input whether he wants to open torrent in client or not
-	reader = bufio.NewReader(os.Stdin)
-	fmt.Println("Do you want to open torrent in torrent client? [y / n]")
-	var launchClient string
-	for {
-		launchClientStr, err := reader.ReadString('\n') // returns string + delimiter
-		if err != nil {
-			fmt.Println("Could not read your input, please try again (should be 'y' or 'n'):")
-			continue
+	// reader = bufio.NewReader(os.Stdin)
+	// fmt.Println("Do you want to open torrent in torrent client? [y / n]")
+	// var launchClient string
+	// for {
+	// launchClientStr, err := reader.ReadString('\n') // returns string + delimiter
+	// if err != nil {
+	// fmt.Println("Could not read your input, please try again (should be 'y' or 'n'):")
+	// continue
+	// }
+	// // Remove delimiter which depends on OS + white spaces if any
+	// launchClient = strings.TrimSpace(strings.TrimSuffix(launchClientStr, lineBreak))
+	// break
+	// }
+
+	// var torrentClientAbbr string
+	// if launchClient == "y" {
+	// // Read from user input whether he wants to open torrent in Deluge or QBittorrent client
+	// reader = bufio.NewReader(os.Stdin)
+	// fmt.Println("Do you want to open torrent in Deluge (d), QBittorrent (q), or Transmission (t)?")
+	// for {
+	// torrentClientAbbrStr, err := reader.ReadString('\n')
+	// if err != nil {
+	// fmt.Println("Could not read your input, please try again (should be 'd', 'q' or 't'):")
+	// continue
+	// }
+	// // Remove delimiter which depends on OS + white spaces if any
+	// torrentClientAbbr = strings.TrimSpace(strings.TrimSuffix(torrentClientAbbrStr, lineBreak))
+	// if torrentClientAbbr != "d" && torrentClientAbbr != "q" && torrentClientAbbr != "t" {
+	// fmt.Println("Please enter a valid torrent client. It should be 'd', 'q' or 't':")
+	// continue
+	// }
+	// break
+	// }
+	// }
+
+	// // Convert user input into proper torrent client name
+	// var torrentClient string
+	// switch torrentClientAbbr {
+	// case "d":
+	// torrentClient = "deluge"
+	// case "q":
+	// torrentClient = "qbittorrent"
+	// case "t":
+	// torrentClient = "transmission-gtk"
+	// }
+
+	sort.Sort(torrentsSlice(fts))
+	csv := "name,link\n"
+	for _, ft := range fts {
+		source := ""
+		if ft.fileURL != "" {
+			source = ft.fileURL
+		} else if ft.magnet != "" {
+			source = ft.magnet
+		} else if ft.filePath != "" {
+			source = ft.filePath
+		} else if ft.descURL != "" {
+			source = ft.descURL
 		}
-		// Remove delimiter which depends on OS + white spaces if any
-		launchClient = strings.TrimSpace(strings.TrimSuffix(launchClientStr, lineBreak))
-		break
+		csv += fmt.Sprintf("%s,%s\n", strings.ReplaceAll(ft.name, " ", "_"), source)
+		// Download torrent and optionnaly open in torrent client
+		// switch ft.source {
+		// case "arc":
+		// getTorrentFile("", s.in, "", timeout, nil)
+		// fmt.Printf("\nHere is your torrent file (%s): %s%s%s", ft.name, lineBreak, ft.filePath, lineBreak)
+		// if launchClient == "y" {
+		// openMagOrTorInClient(ft.filePath, torrentClient)
+		// }
+		// case "tpb":
+		// fmt.Printf("\nHere is your magnet link (%s): %s%s%s", ft.name, lineBreak, ft.magnet, lineBreak)
+		// if launchClient == "y" {
+		// openMagOrTorInClient(ft.magnet, torrentClient)
+		// }
+		// case "otts":
+		// log.WithFields(log.Fields{
+		// "sourceToSearch": "otts",
+		// }).Debug("Extract magnet")
+		// ft.magnet, err = otts.ExtractMag(ft.descURL, timeout)
+		// if err != nil {
+		// fmt.Println("An error occured while retrieving magnet.")
+		// log.WithFields(log.Fields{
+		// "descURL":         ft.descURL,
+		// "sourcesToLookup": s.sourcesToLookup,
+		// "error":           err,
+		// }).Fatal("Could not retrieve magnet")
+		// }
+		// fmt.Printf("\nHere is your magnet link (%s): %s%s%s", ft.name, lineBreak, ft.magnet, lineBreak)
+		// if launchClient == "y" {
+		// openMagOrTorInClient(ft.magnet, torrentClient)
+		// }
+		// case "ygg":
+		// var userID string
+		// var userPass string
+
+		// reader := bufio.NewReader(os.Stdin)
+		// fmt.Println("You need an Ygg Torrent account to download the file.")
+		// fmt.Println("Please enter your user ID: ")
+		// for {
+		// rawUserID, err := reader.ReadString('\n')
+		// if err != nil {
+		// fmt.Println("Could not read your input, please try again:")
+		// continue
+		// }
+		// userID = strings.TrimSpace(strings.TrimSuffix(rawUserID, lineBreak))
+		// break
+		// }
+		// fmt.Println("Please enter your user pass: ")
+		// for {
+		// // Using a special lib for password hiding during input
+		// rawUserPassBytes, err := terminal.ReadPassword(int(syscall.Stdin))
+		// if err != nil {
+		// fmt.Println("Could not read your input, please try again:")
+		// continue
+		// }
+		// rawUserPass := string(rawUserPassBytes)
+		// fmt.Println()
+		// userPass = strings.TrimSpace(strings.TrimSuffix(rawUserPass, lineBreak))
+		// break
+		// }
+		// getTorrentFile(userID, s.in, userPass, timeout, s.httpClient)
+		// fmt.Printf("\nHere is your torrent file (%s): %s%s%s", ft.name, lineBreak, ft.filePath, lineBreak)
+		// if launchClient == "y" {
+		// openMagOrTorInClient(ft.filePath, torrentClient)
+		// }
+		// }
 	}
 
-	var torrentClientAbbr string
-	if launchClient == "y" {
-		// Read from user input whether he wants to open torrent in Deluge or QBittorrent client
-		reader = bufio.NewReader(os.Stdin)
-		fmt.Println("Do you want to open torrent in Deluge (d), QBittorrent (q), or Transmission (t)?")
-		for {
-			torrentClientAbbrStr, err := reader.ReadString('\n')
-			if err != nil {
-				fmt.Println("Could not read your input, please try again (should be 'd', 'q' or 't'):")
-				continue
-			}
-			// Remove delimiter which depends on OS + white spaces if any
-			torrentClientAbbr = strings.TrimSpace(strings.TrimSuffix(torrentClientAbbrStr, lineBreak))
-			if torrentClientAbbr != "d" && torrentClientAbbr != "q" && torrentClientAbbr != "t" {
-				fmt.Println("Please enter a valid torrent client. It should be 'd', 'q' or 't':")
-				continue
-			}
-			break
-		}
+	if output == "" {
+		output = strings.ReplaceAll(
+			fmt.Sprintf("%s_%s", time.Now().Format("2006_01_02_15_04_05"), s.in),
+			" ", "_",
+		)
 	}
-
-	// Convert user input into proper torrent client name
-	var torrentClient string
-	switch torrentClientAbbr {
-	case "d":
-		torrentClient = "deluge"
-	case "q":
-		torrentClient = "qbittorrent"
-	case "t":
-		torrentClient = "transmission-gtk"
+	d1 := []byte(csv)
+	if err := ioutil.WriteFile(fmt.Sprintf("%s.csv", output), d1, 0644); err != nil {
+		log.Error("unable to write csv")
+		os.Exit(1)
 	}
-
-	// Download torrent and optionnaly open in torrent client
-	switch ft.source {
-	case "arc":
-		getTorrentFile("", s.in, "", timeout, nil)
-		fmt.Printf("Here is your torrent file: %s%s%s", lineBreak, ft.filePath, lineBreak)
-		if launchClient == "y" {
-			openMagOrTorInClient(ft.filePath, torrentClient)
-		}
-	case "tpb":
-		fmt.Printf("Here is your magnet link: %s%s%s", lineBreak, ft.magnet, lineBreak)
-		if launchClient == "y" {
-			openMagOrTorInClient(ft.magnet, torrentClient)
-		}
-	case "otts":
-		log.WithFields(log.Fields{
-			"sourceToSearch": "otts",
-		}).Debug("Extract magnet")
-		ft.magnet, err = otts.ExtractMag(ft.descURL, timeout)
-		if err != nil {
-			fmt.Println("An error occured while retrieving magnet.")
-			log.WithFields(log.Fields{
-				"descURL":         ft.descURL,
-				"sourcesToLookup": s.sourcesToLookup,
-				"error":           err,
-			}).Fatal("Could not retrieve magnet")
-		}
-		fmt.Printf("Here is your magnet link: %s%s%s", lineBreak, ft.magnet, lineBreak)
-		if launchClient == "y" {
-			openMagOrTorInClient(ft.magnet, torrentClient)
-		}
-	case "ygg":
-		var userID string
-		var userPass string
-
-		reader := bufio.NewReader(os.Stdin)
-		fmt.Println("You need an Ygg Torrent account to download the file.")
-		fmt.Println("Please enter your user ID: ")
-		for {
-			rawUserID, err := reader.ReadString('\n')
-			if err != nil {
-				fmt.Println("Could not read your input, please try again:")
-				continue
-			}
-			userID = strings.TrimSpace(strings.TrimSuffix(rawUserID, lineBreak))
-			break
-		}
-		fmt.Println("Please enter your user pass: ")
-		for {
-			// Using a special lib for password hiding during input
-			rawUserPassBytes, err := terminal.ReadPassword(int(syscall.Stdin))
-			if err != nil {
-				fmt.Println("Could not read your input, please try again:")
-				continue
-			}
-			rawUserPass := string(rawUserPassBytes)
-			fmt.Println()
-			userPass = strings.TrimSpace(strings.TrimSuffix(rawUserPass, lineBreak))
-			break
-		}
-		getTorrentFile(userID, s.in, userPass, timeout, s.httpClient)
-		fmt.Printf("Here is your torrent file: %s%s%s", lineBreak, ft.filePath, lineBreak)
-		if launchClient == "y" {
-			openMagOrTorInClient(ft.filePath, torrentClient)
-		}
-	}
+	fmt.Printf("Torrents/magnet links saved in - %s \n", output)
 }
